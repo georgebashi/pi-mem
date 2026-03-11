@@ -260,24 +260,31 @@ export default function piMem(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!enabled) return;
 
+		// Fire-and-forget: prompt capture should never block the agent start
 		if (store && event.prompt) {
-			await addPrompt(store, {
+			addPrompt(store, {
 				session_id: sessionId,
 				project: projectSlug,
 				timestamp: new Date().toISOString(),
 				text: event.prompt,
-			});
+			}).catch(() => {});
 		}
 
 		if (!config.autoInject) return;
 
 		try {
-			const context = await buildInjectedContext(
+			// Timeout context injection to prevent hanging the prompt pipeline.
+			// LanceDB queries or embedding API calls can occasionally stall.
+			const contextPromise = buildInjectedContext(
 				store,
 				projectSlug,
 				config,
 				event.prompt,
 			);
+			const timeoutPromise = new Promise<null>((resolve) =>
+				setTimeout(() => resolve(null), 10_000),
+			);
+			const context = await Promise.race([contextPromise, timeoutPromise]);
 
 			if (context) {
 				return {
