@@ -131,6 +131,7 @@ async function callEmbeddingsAPI(
 			Authorization: `Bearer ${apiKey}`,
 		},
 		body: JSON.stringify({ model, input }),
+		signal: AbortSignal.timeout(15_000),
 	});
 
 	if (!response.ok) {
