@@ -135,8 +135,8 @@ function runSubAgent(
 
 		const timeout = setTimeout(() => {
 			killProcess(proc);
-			resolve({ ok: false, error: "Observer timeout (30s)" });
-		}, 30_000);
+			resolve({ ok: false, error: "Observer timeout (60s)" });
+		}, 60_000);
 
 		const processLine = (line: string) => {
 			if (!line.trim()) return;

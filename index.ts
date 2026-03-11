@@ -25,7 +25,7 @@ import {
 	addManualMemory,
 	getSessionObservations,
 	deleteSessionSummaries,
-	ftsSearch,
+	hybridSearch,
 	timelineSearch,
 	getObservationsByIds,
 	compactAndReindex,
@@ -34,6 +34,7 @@ import {
 import { loadIgnorePatterns, shouldIgnorePath } from "./privacy.js";
 import { buildInjectedContext } from "./context-injection.js";
 import { registerTools } from "./tools.js";
+import { MemoryBrowser } from "./memory-browser.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -51,12 +52,23 @@ export default function piMem(pi: ExtensionAPI) {
 	let enabled = false;
 	let observationCount = 0;
 
+	// ─── CLI Flag ─────────────────────────────────────────────────
+	pi.registerFlag("no-mem", {
+		description: "Disable pi-mem for this session",
+		type: "boolean",
+		default: false,
+	});
+
 	// ─── Session Start ────────────────────────────────────────────
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig();
 
-		if (!config.enabled) {
+		if (!config.enabled || pi.getFlag("--no-mem")) {
 			enabled = false;
+			if (pi.getFlag("--no-mem")) {
+				const theme = ctx.ui.theme;
+				ctx.ui.setStatus("pi-mem", theme.fg("dim", "⌬ disabled (--no-mem)"));
+			}
 			return;
 		}
 		enabled = true;
@@ -74,8 +86,8 @@ export default function piMem(pi: ExtensionAPI) {
 		}
 
 		const theme = ctx.ui.theme;
-		ctx.ui.setStatus("pi-mem", theme.fg("dim", `📝 ${projectSlug}`));
-		ctx.ui.notify("pi-mem loaded", "info");
+		ctx.ui.setStatus("pi-mem", theme.fg("dim", `⌬ ${projectSlug}`));
+
 	});
 
 	// ─── Tool Result Capture ──────────────────────────────────────
@@ -165,7 +177,7 @@ export default function piMem(pi: ExtensionAPI) {
 		const theme = ctx.ui.theme;
 		ctx.ui.setStatus(
 			"pi-mem",
-			theme.fg("dim", `📝 ${projectSlug} (${observationCount} obs)`),
+			theme.fg("dim", `⌬ ${projectSlug} (${observationCount} obs)`),
 		);
 	});
 
@@ -175,19 +187,21 @@ export default function piMem(pi: ExtensionAPI) {
 
 		const theme = ctx.ui.theme;
 
-		// Query observations for this session from LanceDB
-		const observations = await getSessionObservations(store, sessionId);
-
-		if (observations.length < 3) {
-			await compactAndReindex(store).catch(() => {});
-			return;
-		}
-
-		ctx.ui.setStatus("pi-mem", theme.fg("warning", "📝 Summarizing..."));
-
-		// Fire-and-forget summarization
+		// Fire-and-forget: don't block the extension dispatch pipeline.
+		// The sequential handler loop in extensionRunner.emit() awaits each
+		// handler — blocking here delays ALL extensions loaded after pi-mem.
 		(async () => {
 			try {
+				// Query observations for this session from LanceDB
+				const observations = await getSessionObservations(store, sessionId);
+
+				if (observations.length < 3) {
+					await compactAndReindex(store).catch(() => {});
+					return;
+				}
+
+				ctx.ui.setStatus("pi-mem", theme.fg("warning", "⌬ Summarizing..."));
+
 				// Collect files from structured observation data
 				const { filesRead, filesModified } = collectFilesFromObservations(observations);
 
@@ -226,7 +240,7 @@ export default function piMem(pi: ExtensionAPI) {
 
 				await compactAndReindex(store!);
 
-				ctx.ui.setStatus("pi-mem", theme.fg("dim", `📝 ${projectSlug} ✓`));
+				ctx.ui.setStatus("pi-mem", theme.fg("dim", `⌬ ${projectSlug} ✓`));
 			} catch (e: any) {
 				const errMsg = e?.message || String(e);
 				try {
@@ -237,7 +251,7 @@ export default function piMem(pi: ExtensionAPI) {
 					);
 				} catch {}
 				await compactAndReindex(store!).catch(() => {});
-				ctx.ui.setStatus("pi-mem", theme.fg("error", "📝 Summary failed"));
+				ctx.ui.setStatus("pi-mem", theme.fg("error", "⌬ Summary failed"));
 			}
 		})();
 	});
@@ -308,11 +322,174 @@ export default function piMem(pi: ExtensionAPI) {
 		},
 	});
 
+	// ─── /mem-disable Command ─────────────────────────────────────
+	pi.registerCommand("mem-disable", {
+		description: "Disable pi-mem for the rest of this session",
+		handler: async (_args, ctx) => {
+			if (!enabled) {
+				ctx.ui.notify("pi-mem is already disabled", "info");
+				return;
+			}
+			enabled = false;
+			const theme = ctx.ui.theme;
+			ctx.ui.setStatus("pi-mem", theme.fg("dim", "⌬ disabled"));
+			ctx.ui.notify("pi-mem disabled for this session", "info");
+		},
+	});
+
+	// ─── /mem-enable Command ──────────────────────────────────────
+	pi.registerCommand("mem-enable", {
+		description: "Re-enable pi-mem for this session",
+		handler: async (_args, ctx) => {
+			if (enabled) {
+				ctx.ui.notify("pi-mem is already enabled", "info");
+				return;
+			}
+
+			// Need config to be loaded
+			if (!config) {
+				config = loadConfig();
+			}
+
+			if (!config.enabled) {
+				ctx.ui.notify("pi-mem is disabled in config — enable it in pi-mem.json first", "warning");
+				return;
+			}
+
+			// Initialize store if not already done
+			if (!store) {
+				if (!projectSlug) {
+					projectSlug = await getProjectSlug(ctx.cwd);
+				}
+				if (!sessionId) {
+					sessionId = crypto.randomUUID().slice(0, 8);
+				}
+				ignorePatterns = loadIgnorePatterns(ctx.cwd);
+				try {
+					store = await initStore(config, { modelRegistry: ctx.modelRegistry });
+				} catch {
+					store = null;
+				}
+			}
+
+			enabled = true;
+			const theme = ctx.ui.theme;
+			ctx.ui.setStatus(
+				"pi-mem",
+				theme.fg("dim", `⌬ ${projectSlug}${observationCount > 0 ? ` (${observationCount} obs)` : ""}`),
+			);
+			ctx.ui.notify("pi-mem enabled for this session", "info");
+		},
+	});
+
+	// ─── /mem-browse Command ──────────────────────────────────────
+	pi.registerCommand("mem-browse", {
+		description: "Browse and manage pi-mem memories interactively",
+		handler: async (_args, ctx) => {
+			if (!enabled || !store?.available) {
+				ctx.ui.notify("pi-mem is not available", "info");
+				return;
+			}
+
+			await ctx.waitForIdle();
+
+			// Track pending actions that require leaving custom UI
+			let pendingAction: {
+				type: "edit" | "delete";
+				itemId: string;
+				itemTitle: string;
+				itemNarrative?: string;
+			} | null = null;
+			let browserInstance: MemoryBrowser | null = null;
+
+			// Loop: show browser, handle actions that need native UI, re-show
+			while (true) {
+				pendingAction = null;
+
+				await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+					const browser = new MemoryBrowser({
+						store: store!,
+						projectSlug,
+						config,
+						theme,
+						tui,
+						onClose: () => done(),
+						onEdit: (id, title, narrative) => {
+							pendingAction = { type: "edit", itemId: id, itemTitle: title, itemNarrative: narrative };
+							done();
+						},
+						onDelete: (id, title) => {
+							pendingAction = { type: "delete", itemId: id, itemTitle: title };
+							done();
+						},
+					});
+
+					browserInstance = browser;
+					browser.init().catch(() => {});
+
+					return {
+						render(width: number): string[] {
+							return browser.render(width);
+						},
+						handleInput(data: string): void {
+							browser.handleInput(data).catch(() => {});
+						},
+						invalidate(): void {
+							browser.invalidate();
+						},
+					};
+				});
+
+				// Handle pending action outside of custom UI
+				if (!pendingAction) break; // User quit
+
+				if (pendingAction.type === "delete") {
+					const confirmed = await ctx.ui.confirm(
+						"Delete Memory",
+						`Delete "${pendingAction.itemTitle.slice(0, 60)}"?`,
+					);
+					if (confirmed) {
+						const { deleteObservation: delObs, compactAndReindex: compact } = await import("./observation-store.js");
+						await delObs(store!, pendingAction.itemId);
+						await compact(store!);
+						if (browserInstance) {
+							browserInstance.removeItem(pendingAction.itemId);
+						}
+					}
+				} else if (pendingAction.type === "edit") {
+					const editText = `# Title\n${pendingAction.itemTitle}\n\n# Narrative\n${pendingAction.itemNarrative ?? ""}`;
+					const result = await ctx.ui.editor("Edit Memory", editText);
+					if (result !== undefined) {
+						const titleMatch = result.match(/^# Title\n(.*?)(?:\n\n# Narrative|\n# Narrative)/s);
+						const narrativeMatch = result.match(/# Narrative\n([\s\S]*?)$/);
+						const newTitle = titleMatch?.[1]?.trim() ?? pendingAction.itemTitle;
+						const newNarrative = narrativeMatch?.[1]?.trim() ?? pendingAction.itemNarrative ?? "";
+
+						const fields: { title?: string; narrative?: string } = {};
+						if (newTitle !== pendingAction.itemTitle) fields.title = newTitle;
+						if (newNarrative !== (pendingAction.itemNarrative ?? "")) fields.narrative = newNarrative;
+
+						if (Object.keys(fields).length > 0) {
+							const { updateObservation: updObs, compactAndReindex: compact } = await import("./observation-store.js");
+							await updObs(store!, pendingAction.itemId, fields);
+							await compact(store!);
+							if (browserInstance) {
+								browserInstance.updateItem(pendingAction.itemId, fields);
+							}
+						}
+					}
+				}
+
+				// Re-enter the browser loop
+			}
+		},
+	});
+
 	// ─── Register Search Tools ────────────────────────────────────
 	registerTools(pi, {
 		onSearch: async (params) => {
 			if (!enabled || !store) return [];
-			return ftsSearch(
+			return hybridSearch(
 				store,
 				params.query,
 				{

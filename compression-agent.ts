@@ -60,16 +60,28 @@ function runSubAgent(
 	model: string,
 	thinkingLevel: string,
 ): Promise<{ ok: true; response: string } | { ok: false; error: string }> {
+	// Write prompt and system prompt to temp files to avoid exposing session
+	// content via process arguments (visible in ps output)
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-mem-summarize-"));
+	const systemPromptPath = path.join(tmpDir, "system-prompt.md");
+	const taskPath = path.join(tmpDir, "task.md");
+	fs.writeFileSync(systemPromptPath, systemPrompt, { mode: 0o600 });
+	fs.writeFileSync(taskPath, prompt, { mode: 0o600 });
+
+	const cleanupTmp = () => {
+		try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
+	};
+
 	return new Promise((resolve) => {
 		const proc = spawn("pi", [
 			"--mode", "json",
 			"-p",
 			"--no-session",
 			"--no-tools",
-			"--system-prompt", systemPrompt,
+			"--system-prompt", systemPromptPath,
 			"--model", model,
 			"--thinking", thinkingLevel,
-			prompt,
+			`@${taskPath}`,
 		], {
 			stdio: ["ignore", "pipe", "pipe"],
 			env: { ...process.env, PI_MEM_SUB_AGENT: "1" },
@@ -80,9 +92,10 @@ function runSubAgent(
 		let stderr = "";
 
 		const timeout = setTimeout(() => {
+			cleanupTmp();
 			killProcess(proc);
-			resolve({ ok: false, error: "Summarization timeout (30s)" });
-		}, 30_000);
+			resolve({ ok: false, error: "Summarization timeout (90s)" });
+		}, 90_000);
 
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
@@ -113,6 +126,7 @@ function runSubAgent(
 
 		proc.on("close", (code) => {
 			clearTimeout(timeout);
+			cleanupTmp();
 			if (buffer.trim()) processLine(buffer);
 
 			if (lastAssistantText) {
@@ -126,6 +140,7 @@ function runSubAgent(
 
 		proc.on("error", (err) => {
 			clearTimeout(timeout);
+			cleanupTmp();
 			resolve({ ok: false, error: `Failed to spawn pi: ${err.message}` });
 		});
 	});

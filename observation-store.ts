@@ -496,7 +496,7 @@ export interface SearchFilters {
 	dateEnd?: string;
 }
 
-function buildWhereClause(filters: SearchFilters): string {
+function buildWhereClause(filters: SearchFilters, excludePrompts = false): string {
 	const parts: string[] = [];
 
 	if (filters.project) {
@@ -504,6 +504,8 @@ function buildWhereClause(filters: SearchFilters): string {
 	}
 	if (filters.obs_type) {
 		parts.push(`type = '${filters.obs_type}'`);
+	} else if (excludePrompts) {
+		parts.push(`type != 'prompt'`);
 	}
 	if (filters.dateStart) {
 		parts.push(`timestamp >= '${filters.dateStart}'`);
@@ -530,7 +532,7 @@ export async function ftsSearch(
 	try {
 		let search = store.table.search(query, "fts", ["narrative"]).limit(limit + offset);
 
-		const where = buildWhereClause(filters);
+		const where = buildWhereClause(filters, true);
 		if (where) {
 			search = search.where(where);
 		}
@@ -541,6 +543,133 @@ export async function ftsSearch(
 		const sliced = rows.slice(offset, offset + limit);
 
 		return sliced.map((r: any) => ({
+			id: r.id,
+			session_id: r.session_id,
+			project: r.project,
+			type: r.type,
+			obs_type: r.obs_type,
+			timestamp: r.timestamp,
+			tool_name: r.tool_name,
+			title: r.title,
+			subtitle: r.subtitle,
+		}));
+	} catch {
+		return [];
+	}
+}
+
+// ─── Hybrid Search ───────────────────────────────────────────
+
+interface RankedItem {
+	id: string;
+	result: IndexResult;
+}
+
+/**
+ * Reciprocal Rank Fusion: merge multiple ranked lists into one.
+ * Each item's score = sum of weight / (k + rank + 1) across lists.
+ * Items appearing in multiple lists get boosted naturally.
+ */
+function reciprocalRankFusion(
+	lists: RankedItem[][],
+	weights: number[] = [],
+	k = 60,
+): IndexResult[] {
+	const scores = new Map<string, { result: IndexResult; score: number }>();
+
+	for (let listIdx = 0; listIdx < lists.length; listIdx++) {
+		const list = lists[listIdx];
+		if (!list) continue;
+		const weight = weights[listIdx] ?? 1.0;
+
+		for (let rank = 0; rank < list.length; rank++) {
+			const item = list[rank];
+			if (!item) continue;
+			const contribution = weight / (k + rank + 1);
+			const existing = scores.get(item.id);
+
+			if (existing) {
+				existing.score += contribution;
+			} else {
+				scores.set(item.id, { result: item.result, score: contribution });
+			}
+		}
+	}
+
+	return Array.from(scores.values())
+		.sort((a, b) => b.score - a.score)
+		.map((e) => e.result);
+}
+
+/**
+ * Hybrid search: runs FTS and vector search in parallel, merges with RRF.
+ * FTS searches all non-prompt rows; vector searches summaries + manual saves.
+ * Falls back to FTS-only if embeddings are unavailable.
+ */
+export async function hybridSearch(
+	store: ObservationStore,
+	query: string,
+	filters: SearchFilters = {},
+	limit = 20,
+	offset = 0,
+): Promise<IndexResult[]> {
+	if (!store.available || !store.table) return [];
+
+	// Run FTS and vector search in parallel
+	const candidateLimit = Math.max(limit * 3, 40);
+
+	const ftsPromise = ftsSearch(store, query, filters, candidateLimit, 0);
+
+	const vecPromise = (store.embed
+		? vectorSearchForIndex(store, query, filters.project, candidateLimit)
+		: Promise.resolve([] as IndexResult[])
+	);
+
+	const [ftsResults, vecResults] = await Promise.all([ftsPromise, vecPromise]);
+
+	// If no vector results, just return FTS directly
+	if (vecResults.length === 0) {
+		return ftsResults.slice(offset, offset + limit);
+	}
+
+	// Build ranked lists for RRF
+	const ftsList: RankedItem[] = ftsResults.map((r) => ({ id: r.id, result: r }));
+	const vecList: RankedItem[] = vecResults.map((r) => ({ id: r.id, result: r }));
+
+	// FTS gets higher weight (2x) since it covers all row types
+	const fused = reciprocalRankFusion([ftsList, vecList], [2.0, 1.0]);
+
+	return fused.slice(offset, offset + limit);
+}
+
+/**
+ * Vector search that returns IndexResult (not FullResult).
+ * Searches summaries + manual saves only (they have real embeddings).
+ */
+async function vectorSearchForIndex(
+	store: ObservationStore,
+	queryText: string,
+	project?: string,
+	limit = 20,
+): Promise<IndexResult[]> {
+	if (!store.available || !store.table || !store.embed) return [];
+
+	try {
+		const queryVector = await store.embed(queryText);
+
+		let search = store.table.vectorSearch(queryVector).limit(limit);
+
+		const whereParts = ["type IN ('summary', 'manual')"];
+		if (project) {
+			whereParts.push(`project = '${project}'`);
+		}
+		search = search.where(whereParts.join(" AND "));
+
+		search = search.select(INDEX_COLUMNS);
+
+		const rows = await search.toArray();
+
+		return rows.map((r: any) => ({
 			id: r.id,
 			session_id: r.session_id,
 			project: r.project,
@@ -741,7 +870,7 @@ export async function semanticSearch(
 		search = search.select([
 			"id", "session_id", "project", "type", "obs_type", "timestamp",
 			"tool_name", "title", "subtitle", "facts", "narrative",
-			"concepts", "files_read", "files_modified",
+			"concepts", "files_read", "files_modified", "_distance",
 		]);
 
 		const rows = await search.toArray();
@@ -770,6 +899,190 @@ function rowToFullResult(r: any): FullResult {
 		files_read: fromJsonArray(r.files_read),
 		files_modified: fromJsonArray(r.files_modified),
 	};
+}
+
+// ─── CRUD Operations ──────────────────────────────────────────
+
+/**
+ * Delete a single observation by ID.
+ */
+export async function deleteObservation(
+	store: ObservationStore,
+	id: string,
+): Promise<void> {
+	if (!store.available || !store.table) return;
+
+	try {
+		await store.table.delete(`id = '${id}'`);
+	} catch {
+		// Non-fatal
+	}
+}
+
+/**
+ * Get the type field for a row by ID, or null if not found.
+ */
+export async function getObservationType(
+	store: ObservationStore,
+	id: string,
+): Promise<string | null> {
+	if (!store.available || !store.table) return null;
+
+	try {
+		const rows = await store.table
+			.query()
+			.where(`id = '${id}'`)
+			.select(["type"])
+			.toArray();
+		return rows[0]?.type ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Update observation fields by ID. Supports title, narrative, and concepts.
+ * When narrative changes on a summary/manual row, recomputes the embedding vector.
+ */
+export async function updateObservation(
+	store: ObservationStore,
+	id: string,
+	fields: { title?: string; narrative?: string; concepts?: string },
+): Promise<void> {
+	if (!store.available || !store.table) return;
+
+	try {
+		const values: Record<string, any> = {};
+		if (fields.title !== undefined) values.title = fields.title;
+		if (fields.narrative !== undefined) values.narrative = fields.narrative;
+		if (fields.concepts !== undefined) values.concepts = fields.concepts;
+
+		if (Object.keys(values).length === 0) return;
+
+		// Re-embed if narrative changed on a summary/manual row
+		if (fields.narrative !== undefined && store.embed) {
+			const rowType = await getObservationType(store, id);
+			if (rowType === "summary" || rowType === "manual") {
+				try {
+					values.vector = await store.embed(fields.narrative);
+				} catch {
+					// Graceful degradation — keep old vector
+				}
+			}
+		}
+
+		await store.table.update({ where: `id = '${id}'`, values });
+	} catch {
+		// Non-fatal
+	}
+}
+
+/**
+ * Options for listing observations.
+ */
+export interface ListOptions {
+	project?: string;
+	type?: string;
+	limit?: number;
+	offset?: number;
+	order?: "asc" | "desc";
+}
+
+/**
+ * List observations with pagination and filtering.
+ */
+export async function listObservations(
+	store: ObservationStore,
+	options: ListOptions = {},
+): Promise<IndexResult[]> {
+	if (!store.available || !store.table) return [];
+
+	try {
+		const whereParts: string[] = [];
+		if (options.project) {
+			whereParts.push(`project = '${options.project}'`);
+		}
+		if (options.type) {
+			whereParts.push(`type = '${options.type}'`);
+		}
+
+		let query = store.table.query();
+		if (whereParts.length > 0) {
+			query = query.where(whereParts.join(" AND "));
+		}
+		query = query.select(INDEX_COLUMNS);
+
+		const rows = await query.toArray();
+
+		// Sort by timestamp
+		const desc = options.order !== "asc";
+		rows.sort((a: any, b: any) =>
+			desc
+				? b.timestamp.localeCompare(a.timestamp)
+				: a.timestamp.localeCompare(b.timestamp),
+		);
+
+		// Apply offset/limit
+		const offset = options.offset ?? 0;
+		const limit = options.limit ?? 100;
+		const sliced = rows.slice(offset, offset + limit);
+
+		return sliced.map((r: any) => ({
+			id: r.id,
+			session_id: r.session_id,
+			project: r.project,
+			type: r.type,
+			obs_type: r.obs_type,
+			timestamp: r.timestamp,
+			tool_name: r.tool_name,
+			title: r.title,
+			subtitle: r.subtitle,
+		}));
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Count observations matching filters.
+ */
+export async function countObservations(
+	store: ObservationStore,
+	options: { project?: string; type?: string } = {},
+): Promise<number> {
+	if (!store.available || !store.table) return 0;
+
+	try {
+		const whereParts: string[] = [];
+		if (options.project) {
+			whereParts.push(`project = '${options.project}'`);
+		}
+		if (options.type) {
+			whereParts.push(`type = '${options.type}'`);
+		}
+
+		let query = store.table.query();
+		if (whereParts.length > 0) {
+			query = query.where(whereParts.join(" AND "));
+		}
+		query = query.select(["id"]);
+
+		const rows = await query.toArray();
+		return rows.length;
+	} catch {
+		return 0;
+	}
+}
+
+/**
+ * Get a single observation by ID with full details.
+ */
+export async function getObservationById(
+	store: ObservationStore,
+	id: string,
+): Promise<FullResult | null> {
+	const results = await getObservationsByIds(store, [id]);
+	return results[0] ?? null;
 }
 
 // ─── Session Summary Management ───────────────────────────────
