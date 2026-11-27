@@ -261,7 +261,7 @@ export default function piMem(pi: ExtensionAPI) {
 		if (!enabled) return;
 
 		// Fire-and-forget: prompt capture should never block the agent start
-		if (store && event.prompt) {
+		if (store && event.prompt && config.capturePrompts) {
 			addPrompt(store, {
 				session_id: sessionId,
 				project: projectSlug,

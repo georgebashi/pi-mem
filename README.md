@@ -33,6 +33,7 @@ Create `~/.pi/agent/pi-mem.json` or `~/.pi-mem/config.json` (optional — all se
 {
   "enabled": true,
   "autoInject": true,
+  "capturePrompts": true,
   "maxObservationLength": 4000,
   "summaryModel": "anthropic/claude-haiku-3",
   "indexSize": 10,
@@ -47,6 +48,7 @@ Create `~/.pi/agent/pi-mem.json` or `~/.pi-mem/config.json` (optional — all se
 |---------|---------|-------------|
 | `enabled` | `true` | Enable/disable the extension |
 | `autoInject` | `true` | Automatically inject past memories at session start |
+| `capturePrompts` | `true` | Record each user prompt verbatim in the observation store. Set `false` to keep only observations and explicit memory writes |
 | `maxObservationLength` | `4000` | Max characters per tool output observation |
 | `summaryModel` | (current model) | Model to use for session summarization |
 | `observerModel` | (falls back to summaryModel) | Model for per-tool observation extraction |
