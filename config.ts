@@ -10,6 +10,8 @@ import * as os from "node:os";
 export interface PiMemConfig {
 	enabled: boolean;
 	autoInject: boolean;
+	/** Record each user prompt verbatim in the observation store (default true). */
+	capturePrompts: boolean;
 	maxObservationLength: number;
 	/** Model for observation extraction (e.g. "provider/model-id"). Falls back to summaryModel → session model. */
 	observerModel?: string;
@@ -30,6 +32,7 @@ export interface PiMemConfig {
 const DEFAULTS: PiMemConfig = {
 	enabled: true,
 	autoInject: true,
+	capturePrompts: true,
 	maxObservationLength: 4000,
 	indexSize: 10,
 	tokenBudget: 2000,
